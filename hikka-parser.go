@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,11 +28,12 @@ const (
 )
 
 var (
-	outputDir    = "output"
-	outputPath   = filepath.Join(outputDir, "hikka-full.json")
-	progressPath = filepath.Join(outputDir, "parser-progress.json")
-	dbPath       = filepath.Join(outputDir, "hikka.db")
-	httpClient   = &http.Client{Timeout: RequestTimeout}
+	outputDir     = "output"
+	outputPath    = filepath.Join(outputDir, "hikka-full.json")
+	progressPath  = filepath.Join(outputDir, "parser-progress.json")
+	animeDBPath   = filepath.Join(outputDir, "anime.db")
+	watchDBPath   = filepath.Join(outputDir, "watch.db")
+	httpClient    = &http.Client{Timeout: RequestTimeout}
 )
 
 type Pagination struct {
@@ -249,19 +251,20 @@ func processPageBatch(pages []int, watchSem chan struct{}) []map[string]any {
 
 // ==================== Database Functions ====================
 
-func createDatabase(animeList []map[string]any) error {
-	fmt.Println("\n[DB] Creating SQLite database...")
+func createDatabases(animeList []map[string]any, skipWatch bool) error {
+	fmt.Println("\n[DB] Creating SQLite databases...")
 
-	os.Remove(dbPath)
+	os.Remove(animeDBPath)
+	os.Remove(watchDBPath)
 
-	db, err := sql.Open("sqlite3", dbPath)
+	// Create anime.db
+	animeDB, err := sql.Open("sqlite3", animeDBPath)
 	if err != nil {
-		return fmt.Errorf("error opening database: %v", err)
+		return fmt.Errorf("error opening anime database: %v", err)
 	}
-	defer db.Close()
+	defer animeDB.Close()
 
-	// Create tables
-	_, err = db.Exec(`
+	_, err = animeDB.Exec(`
 		CREATE TABLE IF NOT EXISTS anime (
 			slug TEXT PRIMARY KEY,
 			data_type TEXT,
@@ -289,34 +292,80 @@ func createDatabase(animeList []map[string]any) error {
 		return fmt.Errorf("error creating anime table: %v", err)
 	}
 
-	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS watch (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			slug TEXT NOT NULL,
-			source TEXT NOT NULL,
-			team TEXT NOT NULL,
-			episode INTEGER NOT NULL,
-			video_url TEXT NOT NULL,
-			FOREIGN KEY (slug) REFERENCES anime(slug)
-		)
-	`)
+	// Create watch.db
+	watchDB, err := sql.Open("sqlite3", watchDBPath)
+	if err != nil {
+		return fmt.Errorf("error opening watch database: %v", err)
+	}
+	defer watchDB.Close()
+
+	var createWatchSQL string
+	if skipWatch {
+		createWatchSQL = `
+			CREATE TABLE IF NOT EXISTS watch (
+				slug TEXT NOT NULL,
+				team TEXT NOT NULL,
+				PRIMARY KEY (slug, team)
+			)
+		`
+	} else {
+		createWatchSQL = `
+			CREATE TABLE IF NOT EXISTS watch (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				slug TEXT NOT NULL,
+				source TEXT NOT NULL,
+				team TEXT NOT NULL,
+				episode INTEGER NOT NULL,
+				video_url TEXT NOT NULL
+			)
+		`
+	}
+
+	_, err = watchDB.Exec(createWatchSQL)
 	if err != nil {
 		return fmt.Errorf("error creating watch table: %v", err)
 	}
 
-	// Create indexes
-	db.Exec("CREATE INDEX idx_watch_slug ON watch(slug)")
-	db.Exec("CREATE INDEX idx_watch_source ON watch(source)")
-	db.Exec("CREATE INDEX idx_watch_team ON watch(team)")
-	db.Exec("CREATE INDEX idx_watch_episode ON watch(episode)")
-
-	// Begin transaction
-	tx, err := db.Begin()
-	if err != nil {
-		return fmt.Errorf("error starting transaction: %v", err)
+	// Create indexes for watch.db
+	if skipWatch {
+		watchDB.Exec("CREATE INDEX idx_watch_slug ON watch(slug)")
+		watchDB.Exec("CREATE INDEX idx_watch_team ON watch(team)")
+	} else {
+		watchDB.Exec("CREATE INDEX idx_watch_slug ON watch(slug)")
+		watchDB.Exec("CREATE INDEX idx_watch_source ON watch(source)")
+		watchDB.Exec("CREATE INDEX idx_watch_team ON watch(team)")
+		watchDB.Exec("CREATE INDEX idx_watch_episode ON watch(episode)")
 	}
 
-	animeStmt, err := tx.Prepare(`
+	// Begin transactions
+	animeTx, err := animeDB.Begin()
+	if err != nil {
+		return fmt.Errorf("error starting anime transaction: %v", err)
+	}
+
+	watchTx, err := watchDB.Begin()
+	if err != nil {
+		return fmt.Errorf("error starting watch transaction: %v", err)
+	}
+
+	var watchStmt *sql.Stmt
+	if skipWatch {
+		watchStmt, err = watchTx.Prepare(`
+			INSERT OR IGNORE INTO watch (slug, team)
+			VALUES (?, ?)
+		`)
+	} else {
+		watchStmt, err = watchTx.Prepare(`
+			INSERT INTO watch (slug, source, team, episode, video_url)
+			VALUES (?, ?, ?, ?, ?)
+		`)
+	}
+	if err != nil {
+		return fmt.Errorf("error preparing watch statement: %v", err)
+	}
+	defer watchStmt.Close()
+
+	animeStmt, err := animeTx.Prepare(`
 		INSERT OR REPLACE INTO anime (
 			slug, data_type, title_en, title_ja, title_ua, image, media_type,
 			source, status, rating, season, episodes_released, episodes_total,
@@ -328,15 +377,6 @@ func createDatabase(animeList []map[string]any) error {
 		return fmt.Errorf("error preparing anime statement: %v", err)
 	}
 	defer animeStmt.Close()
-
-	watchStmt, err := tx.Prepare(`
-		INSERT INTO watch (slug, source, team, episode, video_url)
-		VALUES (?, ?, ?, ?, ?)
-	`)
-	if err != nil {
-		return fmt.Errorf("error preparing watch statement: %v", err)
-	}
-	defer watchStmt.Close()
 
 	animeCount := 0
 	watchCount := 0
@@ -382,7 +422,6 @@ func createDatabase(animeList []map[string]any) error {
 		}
 
 		for sourceName, teamsRaw := range watchData {
-			// Skip non-object fields like "type"
 			teamsMap, ok := teamsRaw.(map[string]any)
 			if !ok {
 				continue
@@ -394,37 +433,48 @@ func createDatabase(animeList []map[string]any) error {
 					continue
 				}
 
-				for _, epRaw := range episodes {
-					ep, ok := epRaw.(map[string]any)
-					if !ok {
-						continue
+				if skipWatch {
+					_, err = watchStmt.Exec(slug, teamName)
+					if err == nil {
+						watchCount++
 					}
+				} else {
+					for _, epRaw := range episodes {
+						ep, ok := epRaw.(map[string]any)
+						if !ok {
+							continue
+						}
 
-					episode, _ := ep["episode"].(float64)
-					videoURL, _ := ep["video_url"].(string)
-
-					_, err = watchStmt.Exec(
-						slug,
-						sourceName,
-						teamName,
-						int(episode),
-						videoURL,
-					)
-					if err != nil {
-						continue
+						episode, _ := ep["episode"].(float64)
+						videoURL, _ := ep["video_url"].(string)
+						_, err = watchStmt.Exec(
+							slug,
+							sourceName,
+							teamName,
+							int(episode),
+							videoURL,
+						)
+						if err != nil {
+							continue
+						}
+						watchCount++
 					}
-					watchCount++
 				}
 			}
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("error committing transaction: %v", err)
+	if err := animeTx.Commit(); err != nil {
+		return fmt.Errorf("error committing anime transaction: %v", err)
 	}
 
-	fmt.Printf("[DB] Created: %s\n", dbPath)
+	fmt.Printf("[DB] Created: %s\n", animeDBPath)
 	fmt.Printf("[DB] Anime records: %d\n", animeCount)
+
+	if err := watchTx.Commit(); err != nil {
+		return fmt.Errorf("error committing watch transaction: %v", err)
+	}
+	fmt.Printf("[DB] Created: %s\n", watchDBPath)
 	fmt.Printf("[DB] Watch records: %d\n", watchCount)
 
 	return nil
@@ -432,96 +482,19 @@ func createDatabase(animeList []map[string]any) error {
 
 // ==================== Main ====================
 
-func main() {
-	// Create output directory
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		fmt.Printf("[FATAL] Cannot create output directory: %v\n", err)
-		os.Exit(1)
+func loadJSON() ([]map[string]any, error) {
+	data, err := os.ReadFile(outputPath)
+	if err != nil {
+		return nil, err
 	}
-
-	fmt.Println("==================================================")
-	fmt.Println("  HIKKA PARSER + DATABASE")
-	fmt.Println("==================================================")
-	fmt.Printf("  Output directory: %s\n", outputDir)
-	fmt.Printf("  Concurrent pages: %d\n", ConcurrentPages)
-	fmt.Printf("  Concurrent watch: %d\n", ConcurrentWatch)
-	fmt.Println()
-
-	var animeList []map[string]any
-	startPage := 1
-	totalPages := 0
-
-	// Check progress
-	if progress := loadProgress(); progress != nil {
-		fmt.Printf("Found progress: page %d/%d, %d anime\n", progress.CurrentPage, progress.TotalPages, len(progress.AnimeList))
-		fmt.Print("Continue? (y/n): ")
-		var answer string
-		fmt.Scanln(&answer)
-		if answer == "y" || answer == "Y" {
-			animeList = progress.AnimeList
-			startPage = progress.CurrentPage
-			totalPages = progress.TotalPages
-			fmt.Println("Continuing...\n")
-		} else {
-			fmt.Println("Starting fresh...\n")
-		}
+	var output Output
+	if err := json.Unmarshal(data, &output); err != nil {
+		return nil, err
 	}
+	return output.List, nil
+}
 
-	// Get total pages
-	if totalPages == 0 {
-		fmt.Println("Getting info...")
-		firstPage, err := fetchAnimePage(1)
-		if err != nil {
-			fmt.Printf("[FATAL] %v\n", err)
-			os.Exit(1)
-		}
-		totalPages = firstPage.Pagination.Pages
-		fmt.Printf("Total: %d pages, %d anime\n\n", totalPages, firstPage.Pagination.Total)
-	}
-
-	watchSem := make(chan struct{}, ConcurrentWatch)
-	startTime := time.Now()
-
-	// Process batches
-	for batchStart := startPage; batchStart <= totalPages; batchStart += ConcurrentPages {
-		batchEnd := batchStart + ConcurrentPages - 1
-		if batchEnd > totalPages {
-			batchEnd = totalPages
-		}
-
-		pages := make([]int, 0, batchEnd-batchStart+1)
-		for p := batchStart; p <= batchEnd; p++ {
-			pages = append(pages, p)
-		}
-
-		elapsed := time.Since(startTime).Seconds()
-		fmt.Printf("\n[%.1fs] Pages %d-%d / %d\n", elapsed, batchStart, batchEnd, totalPages)
-
-		batchResults := processPageBatch(pages, watchSem)
-		animeList = append(animeList, batchResults...)
-
-		saveProgress(&Progress{
-			CurrentPage: batchEnd + 1,
-			TotalPages:  totalPages,
-			AnimeList:   animeList,
-		})
-		fmt.Printf("  Saved: %d anime\n", len(animeList))
-
-		if batchEnd < totalPages {
-			time.Sleep(DelayBetweenBatch)
-		}
-	}
-
-	// Save JSON result
-	totalTime := time.Since(startTime).Seconds()
-	fmt.Println("\n==================================================")
-	fmt.Printf("PARSING DONE in %.1fs\n", totalTime)
-	fmt.Println("==================================================")
-
-	saveJSON(animeList)
-	os.Remove(progressPath)
-
-	// Statistics
+func printStats(animeList []map[string]any) {
 	withWatch, withTeams := 0, 0
 	providers := make(map[string]int)
 
@@ -554,21 +527,153 @@ func main() {
 	fmt.Printf("With watch: %d\n", withWatch)
 	fmt.Printf("With teams: %d\n", withTeams)
 	fmt.Printf("Providers: %v\n", providers)
-	fmt.Printf("\nJSON: %s\n", outputPath)
+}
 
-	// Create database
-	fmt.Println("\n==================================================")
-	fmt.Println("CREATING DATABASE")
-	fmt.Println("==================================================")
+func main() {
+	// Command line flags
+	skipParse := flag.Bool("skip-parse", false, "Skip parsing, use existing hikka-full.json")
+	skipDB := flag.Bool("skip-db", false, "Skip database creation")
+	skipWatch := flag.Bool("skip-watch", false, "Skip watch data (video URLs)")
+	dbOnly := flag.Bool("db-only", false, "Only create databases from existing hikka-full.json")
+	jsonOnly := flag.Bool("json-only", false, "Only parse, skip database creation")
+	flag.Parse()
 
-	if err := createDatabase(animeList); err != nil {
-		fmt.Printf("[ERROR] Database creation failed: %v\n", err)
+	// Handle conflicting flags
+	if *dbOnly {
+		*skipParse = true
+		*skipDB = false
+	}
+	if *jsonOnly {
+		*skipDB = true
+	}
+
+	// Create output directory
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		fmt.Printf("[FATAL] Cannot create output directory: %v\n", err)
 		os.Exit(1)
+	}
+
+	fmt.Println("==================================================")
+	fmt.Println("  HIKKA PARSER + DATABASE")
+	fmt.Println("==================================================")
+	fmt.Printf("  Output directory: %s\n", outputDir)
+	if !*skipParse {
+		fmt.Printf("  Concurrent pages: %d\n", ConcurrentPages)
+		fmt.Printf("  Concurrent watch: %d\n", ConcurrentWatch)
+	}
+	fmt.Println()
+
+	var animeList []map[string]any
+
+	if *skipParse {
+		// Load from existing JSON
+		fmt.Printf("Loading from %s...\n", outputPath)
+		var err error
+		animeList, err = loadJSON()
+		if err != nil {
+			fmt.Printf("[FATAL] Cannot load JSON: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Loaded %d anime\n", len(animeList))
+		printStats(animeList)
+	} else {
+		// Parse from API
+		startPage := 1
+		totalPages := 0
+
+		// Check progress
+		if progress := loadProgress(); progress != nil {
+			fmt.Printf("Found progress: page %d/%d, %d anime\n", progress.CurrentPage, progress.TotalPages, len(progress.AnimeList))
+			fmt.Print("Continue? (y/n): ")
+			var answer string
+			fmt.Scanln(&answer)
+			if answer == "y" || answer == "Y" {
+				animeList = progress.AnimeList
+				startPage = progress.CurrentPage
+				totalPages = progress.TotalPages
+				fmt.Println("Continuing...\n")
+			} else {
+				fmt.Println("Starting fresh...\n")
+			}
+		}
+
+		// Get total pages
+		if totalPages == 0 {
+			fmt.Println("Getting info...")
+			firstPage, err := fetchAnimePage(1)
+			if err != nil {
+				fmt.Printf("[FATAL] %v\n", err)
+				os.Exit(1)
+			}
+			totalPages = firstPage.Pagination.Pages
+			fmt.Printf("Total: %d pages, %d anime\n\n", totalPages, firstPage.Pagination.Total)
+		}
+
+		watchSem := make(chan struct{}, ConcurrentWatch)
+		startTime := time.Now()
+
+		// Process batches
+		for batchStart := startPage; batchStart <= totalPages; batchStart += ConcurrentPages {
+			batchEnd := batchStart + ConcurrentPages - 1
+			if batchEnd > totalPages {
+				batchEnd = totalPages
+			}
+
+			pages := make([]int, 0, batchEnd-batchStart+1)
+			for p := batchStart; p <= batchEnd; p++ {
+				pages = append(pages, p)
+			}
+
+			elapsed := time.Since(startTime).Seconds()
+			fmt.Printf("\n[%.1fs] Pages %d-%d / %d\n", elapsed, batchStart, batchEnd, totalPages)
+
+			batchResults := processPageBatch(pages, watchSem)
+			animeList = append(animeList, batchResults...)
+
+			saveProgress(&Progress{
+				CurrentPage: batchEnd + 1,
+				TotalPages:  totalPages,
+				AnimeList:   animeList,
+			})
+			fmt.Printf("  Saved: %d anime\n", len(animeList))
+
+			if batchEnd < totalPages {
+				time.Sleep(DelayBetweenBatch)
+			}
+		}
+
+		// Save JSON result
+		totalTime := time.Since(startTime).Seconds()
+		fmt.Println("\n==================================================")
+		fmt.Printf("PARSING DONE in %.1fs\n", totalTime)
+		fmt.Println("==================================================")
+
+		saveJSON(animeList)
+		os.Remove(progressPath)
+		printStats(animeList)
+		fmt.Printf("\nJSON: %s\n", outputPath)
+	}
+
+	// Create databases
+	if !*skipDB {
+		fmt.Println("\n==================================================")
+		fmt.Println("CREATING DATABASES")
+		fmt.Println("==================================================")
+
+		if err := createDatabases(animeList, *skipWatch); err != nil {
+			fmt.Printf("[ERROR] Database creation failed: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	fmt.Println("\n==================================================")
 	fmt.Println("ALL DONE!")
 	fmt.Println("==================================================")
-	fmt.Printf("JSON file: %s\n", outputPath)
-	fmt.Printf("Database:  %s\n", dbPath)
+	if !*skipParse {
+		fmt.Printf("JSON file:  %s\n", outputPath)
+	}
+	if !*skipDB {
+		fmt.Printf("Anime DB:   %s\n", animeDBPath)
+		fmt.Printf("Watch DB:   %s\n", watchDBPath)
+	}
 }
