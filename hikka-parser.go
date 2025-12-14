@@ -28,12 +28,14 @@ const (
 )
 
 var (
-	outputDir     = "output"
-	outputPath    = filepath.Join(outputDir, "hikka-full.json")
-	progressPath  = filepath.Join(outputDir, "parser-progress.json")
-	animeDBPath   = filepath.Join(outputDir, "anime.db")
-	watchDBPath   = filepath.Join(outputDir, "watch.db")
-	httpClient    = &http.Client{Timeout: RequestTimeout}
+	outputDir      = "output"
+	outputPath     = filepath.Join(outputDir, "hikka-full.json")
+	hikkaJSONPath  = filepath.Join(outputDir, "hikka.json")
+	watchJSONPath  = filepath.Join(outputDir, "watch.json")
+	progressPath   = filepath.Join(outputDir, "parser-progress.json")
+	animeDBPath    = filepath.Join(outputDir, "anime.db")
+	watchDBPath    = filepath.Join(outputDir, "watch.db")
+	httpClient     = &http.Client{Timeout: RequestTimeout}
 )
 
 type Pagination struct {
@@ -169,6 +171,73 @@ func saveJSON(animeList []map[string]any) {
 	}
 	data, _ := json.MarshalIndent(output, "", "  ")
 	os.WriteFile(outputPath, data, 0644)
+}
+
+func saveHikkaJSON(animeList []map[string]any) {
+	// Create hikka.json without watch data
+	cleanList := make([]map[string]any, 0, len(animeList))
+	for _, anime := range animeList {
+		cleanAnime := make(map[string]any)
+		for k, v := range anime {
+			if k != "watch" {
+				cleanAnime[k] = v
+			}
+		}
+		cleanList = append(cleanList, cleanAnime)
+	}
+
+	output := Output{
+		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+		Total:     len(cleanList),
+		List:      cleanList,
+	}
+	data, _ := json.MarshalIndent(output, "", "  ")
+	os.WriteFile(hikkaJSONPath, data, 0644)
+	fmt.Printf("[JSON] Created: %s (%d anime)\n", hikkaJSONPath, len(cleanList))
+}
+
+func saveWatchJSON(animeList []map[string]any) {
+	// Create watch.json: {team_name: [slug1, slug2, ...], ...}
+	teamSlugs := make(map[string][]string)
+
+	for _, anime := range animeList {
+		slug, _ := anime["slug"].(string)
+		if slug == "" {
+			continue
+		}
+
+		watchData, ok := anime["watch"].(map[string]any)
+		if !ok || len(watchData) == 0 {
+			continue
+		}
+
+		// Iterate over sources (e.g., "moon", "ashdi", etc.)
+		for _, teamsRaw := range watchData {
+			teamsMap, ok := teamsRaw.(map[string]any)
+			if !ok {
+				continue
+			}
+
+			// Iterate over teams
+			for teamName := range teamsMap {
+				// Add slug to team if not already present
+				found := false
+				for _, s := range teamSlugs[teamName] {
+					if s == slug {
+						found = true
+						break
+					}
+				}
+				if !found {
+					teamSlugs[teamName] = append(teamSlugs[teamName], slug)
+				}
+			}
+		}
+	}
+
+	data, _ := json.MarshalIndent(teamSlugs, "", "  ")
+	os.WriteFile(watchJSONPath, data, 0644)
+	fmt.Printf("[JSON] Created: %s (%d teams)\n", watchJSONPath, len(teamSlugs))
 }
 
 // ==================== Batch Processing ====================
@@ -576,6 +645,11 @@ func main() {
 		}
 		fmt.Printf("Loaded %d anime\n", len(animeList))
 		printStats(animeList)
+
+		// Create hikka.json and watch.json from existing data
+		fmt.Println("\n[JSON] Creating additional JSON files...")
+		saveHikkaJSON(animeList)
+		saveWatchJSON(animeList)
 	} else {
 		// Parse from API
 		startPage := 1
@@ -652,6 +726,11 @@ func main() {
 		os.Remove(progressPath)
 		printStats(animeList)
 		fmt.Printf("\nJSON: %s\n", outputPath)
+
+		// Create hikka.json and watch.json
+		fmt.Println("\n[JSON] Creating additional JSON files...")
+		saveHikkaJSON(animeList)
+		saveWatchJSON(animeList)
 	}
 
 	// Create databases
@@ -669,11 +748,11 @@ func main() {
 	fmt.Println("\n==================================================")
 	fmt.Println("ALL DONE!")
 	fmt.Println("==================================================")
-	if !*skipParse {
-		fmt.Printf("JSON file:  %s\n", outputPath)
-	}
+	fmt.Printf("Full JSON:   %s\n", outputPath)
+	fmt.Printf("Hikka JSON:  %s\n", hikkaJSONPath)
+	fmt.Printf("Watch JSON:  %s\n", watchJSONPath)
 	if !*skipDB {
-		fmt.Printf("Anime DB:   %s\n", animeDBPath)
-		fmt.Printf("Watch DB:   %s\n", watchDBPath)
+		fmt.Printf("Anime DB:    %s\n", animeDBPath)
+		fmt.Printf("Watch DB:    %s\n", watchDBPath)
 	}
 }
